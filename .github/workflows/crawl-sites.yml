@@ -1,0 +1,155 @@
+name: Crawl sites
+
+on:
+  workflow_dispatch:
+    inputs:
+      domains:
+        description: "Domains/URLs separated by new lines, spaces, commas or semicolons"
+        required: true
+        type: string
+      max_pages:
+        description: "Maximum pages per site (0 = unlimited until runtime safety limit)"
+        required: false
+        default: "0"
+        type: string
+      full_page_scan:
+        description: "Scroll every page to trigger lazy/virtual content (slower)"
+        required: false
+        default: false
+        type: boolean
+      write_raw_links_to_sheets:
+        description: "Also append every link-level row to Google Sheets (can become huge)"
+        required: false
+        default: false
+        type: boolean
+      max_parallel:
+        description: "Maximum number of site jobs to run at once"
+        required: false
+        default: "2"
+        type: string
+      resume_run_id:
+        description: "Optional previous workflow run ID to restore checkpoints from"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sites: ${{ steps.parse.outputs.sites }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse domain list
+        id: parse
+        env:
+          DOMAINS_INPUT: ${{ inputs.domains }}
+        run: python scripts/parse_domains.py
+
+  crawl:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        site: ${{ fromJSON(needs.prepare.outputs.sites) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          crawl4ai-setup
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Restore previous checkpoint/artifact
+        if: ${{ inputs.resume_run_id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: live-drop-hunter-${{ matrix.site.slug }}-${{ inputs.resume_run_id }}
+          path: output
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.resume_run_id }}
+
+      - name: Crawl site
+        id: crawl
+        env:
+          TARGET_DOMAIN: ${{ matrix.site.domain }}
+          TARGET_SLUG: ${{ matrix.site.slug }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+          FULL_PAGE_SCAN: ${{ inputs.full_page_scan }}
+          WRITE_RAW_LINKS: ${{ inputs.write_raw_links_to_sheets }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          JOB_INDEX: ${{ strategy.job-index }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
+        run: |
+          args=(
+            "$TARGET_DOMAIN"
+            --run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$JOB_INDEX-$TARGET_SLUG"
+            --max-pages "$MAX_PAGES"
+            --max-runtime-minutes 315
+          )
+          if [ "$FULL_PAGE_SCAN" = "true" ]; then
+            args+=(--full-page-scan)
+          fi
+          if [ "$WRITE_RAW_LINKS" = "true" ]; then
+            args+=(--write-raw-links-to-sheets)
+          fi
+          if [ -n "$RESUME_RUN_ID" ]; then
+            args+=(--resume)
+          fi
+          python main.py "${args[@]}"
+
+      - name: Upload reports/checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-drop-hunter-${{ matrix.site.slug }}-${{ github.run_id }}
+          path: output/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Crash notification
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET_DOMAIN: ${{ matrix.site.domain }}
+        run: |
+          python - <<'PY'
+          import asyncio
+          import os
+          from drop_hunter.notifier import telegram_send_message
+
+          asyncio.run(telegram_send_message(
+              os.getenv("TELEGRAM_BOT_TOKEN", ""),
+              os.getenv("TELEGRAM_CHAT_ID", ""),
+              "❌ Crawl job crashed\n"
+              + os.getenv("TARGET_DOMAIN", "")
+              + "\nCheckpoint/artifact may still be available.",
+          ))
+          PY
