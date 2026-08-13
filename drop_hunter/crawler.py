@@ -38,8 +38,11 @@ async def _discover_current_urls(crawler: AsyncWebCrawler, start_url: str) -> li
             DomainMapperConfig(
                 source="sitemap+robots+feed+homepage",
                 max_urls=-1,
-                concurrency=20,
-                hits_per_sec=5,
+                # Discovery must be no more aggressive than the crawl itself.  A
+                # burst here was enough to trigger 429s before the first page had
+                # even been saved.
+                concurrency=1,
+                hits_per_sec=0.5,
                 extract_head=False,
                 filter_nonsense_urls=True,
                 soft_404_detection=True,
@@ -216,7 +219,15 @@ async def crawl_site(
     async with AsyncWebCrawler(config=browser_cfg) as crawler:
         if use_current_discovery:
             progress("[discovery] seeding queue from current sitemap/robots/feed/homepage")
-            discovered = await _discover_current_urls(crawler, start_url)
+            try:
+                # Some broken/very large sitemap trees cause amap_domain to wait
+                # indefinitely.  DOM crawling from the homepage is a safe fallback.
+                discovered = await asyncio.wait_for(
+                    _discover_current_urls(crawler, start_url), timeout=90
+                )
+            except asyncio.TimeoutError:
+                discovered = []
+                progress("[discovery] timed out after 90s; continuing from homepage links")
             for url in discovered:
                 enqueue(url)
             seed_count = len(queued) + len(fetched_pages)

@@ -48,6 +48,28 @@ async def main_async():
     tg_chat = os.getenv("TELEGRAM_CHAT_ID", "")
     await telegram_send_message(tg_token, tg_chat, f"🚀 Crawl started\n{url}\nRun: {run_id}")
 
+    # Make the source site visible in the Dashboard immediately.  Previously the
+    # first Sheets write happened only after a potentially multi-hour full crawl,
+    # which looked exactly like a stalled workflow.
+    try:
+        await asyncio.to_thread(
+            sync_run_to_google_sheets,
+            run_id=run_id,
+            source_site=url,
+            stats={
+                "crawl_in_progress": True,
+                "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "pages_crawled": 0,
+                "remaining_queue_urls": 0,
+                "outbound_link_rows": 0,
+                "crawl_errors": 0,
+                "runtime_seconds": 0,
+            },
+            domains=[], drops=[], links=[], errors=[], write_raw_links=False,
+        )
+    except Exception as exc:
+        print(f"[sheets] initial RUNNING status was not written: {type(exc).__name__}: {exc}")
+
     links, stats = await crawl_site(
         url,
         run_dir,

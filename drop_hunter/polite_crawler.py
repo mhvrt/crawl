@@ -61,7 +61,10 @@ async def crawl_site(
         wait = 1.0 - (time.monotonic() - last_request_at)
         if wait > 0:
             await asyncio.sleep(wait)
-        result = await original_arun(self, *args, **kwargs)
+        # Browser navigation can otherwise consume the entire Actions job on one
+        # stalled URL.  It is recorded as an access error by the base crawler and
+        # the rest of the site can still be processed.
+        result = await asyncio.wait_for(original_arun(self, *args, **kwargs), timeout=60)
         last_request_at = time.monotonic()
         return result
 
@@ -71,7 +74,11 @@ async def crawl_site(
         if circuit_open:
             return _deferred(str(url))
 
-        result = await live_request(self, *args, **kwargs)
+        try:
+            result = await live_request(self, *args, **kwargs)
+        except asyncio.TimeoutError:
+            progress(f"[crawl] request timed out after 60s: {url}")
+            raise
         if _status(result) != 429:
             return result
 
@@ -87,7 +94,12 @@ async def crawl_site(
         wait_total += delay
         progress(f"[throttle] 429; waiting {delay:.1f}s once before one probe")
         await asyncio.sleep(delay)
-        probe = await live_request(self, *args, **kwargs)
+        try:
+            probe = await live_request(self, *args, **kwargs)
+        except asyncio.TimeoutError:
+            progress(f"[crawl] 429 probe timed out after 60s: {url}")
+            circuit_open = True
+            return result
         if _status(probe) == 429:
             rate_limit_events += 1
             circuit_open = True
