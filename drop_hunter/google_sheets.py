@@ -72,6 +72,8 @@ def _service():
 
 
 def _status(stats: dict) -> str:
+    if stats.get("crawl_in_progress"):
+        return "RUNNING"
     if not stats.get("crawl_complete"):
         return "PARTIAL"
     if int(stats.get("crawl_errors", 0) or 0) > 0:
