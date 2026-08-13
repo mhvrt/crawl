@@ -12,6 +12,11 @@ on:
         required: false
         default: "0"
         type: string
+      max_runtime_minutes:
+        description: "Maximum runtime per site before saving a resumable checkpoint"
+        required: false
+        default: "45"
+        type: string
       full_page_scan:
         description: "Scroll every page to trigger lazy/virtual content (slower)"
         required: false
@@ -97,6 +102,7 @@ jobs:
           TARGET_DOMAIN: ${{ matrix.site.domain }}
           TARGET_SLUG: ${{ matrix.site.slug }}
           MAX_PAGES: ${{ inputs.max_pages }}
+          MAX_RUNTIME_MINUTES: ${{ inputs.max_runtime_minutes }}
           FULL_PAGE_SCAN: ${{ inputs.full_page_scan }}
           WRITE_RAW_LINKS: ${{ inputs.write_raw_links_to_sheets }}
           RESUME_RUN_ID: ${{ inputs.resume_run_id }}
@@ -111,7 +117,7 @@ jobs:
             "$TARGET_DOMAIN"
             --run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$JOB_INDEX-$TARGET_SLUG"
             --max-pages "$MAX_PAGES"
-            --max-runtime-minutes 315
+            --max-runtime-minutes "$MAX_RUNTIME_MINUTES"
           )
           if [ "$FULL_PAGE_SCAN" = "true" ]; then
             args+=(--full-page-scan)
