@@ -8,7 +8,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-from drop_hunter.crawler import crawl_site
+from drop_hunter.rate_limited_crawler import crawl_site
 from drop_hunter.domain_checker import check_domains
 from drop_hunter.google_sheets import sync_run_to_google_sheets
 from drop_hunter.notifier import telegram_send_document, telegram_send_message
