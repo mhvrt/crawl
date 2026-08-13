@@ -7,12 +7,14 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
+from xml.etree import ElementTree
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig, DomainMapperConfig
+import httpx
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 
 from .link_extractor import extract_external_links, extract_internal_urls
-from .utils import atomic_write_text, canonicalize_url, hostname_from_url, registrable_domain
+from .utils import atomic_write_text, canonicalize_url, hostname_from_url
 
 
 def _metadata_title(result) -> str:
@@ -28,39 +30,70 @@ def _allowed_hosts(start_url: str) -> set[str]:
     return {host, bare, "www." + bare}
 
 
-async def _discover_current_urls(crawler: AsyncWebCrawler, start_url: str) -> list[str]:
-    """Seed exhaustive queue from current site discovery sources."""
-    root = registrable_domain(hostname_from_url(start_url))
-    allowed = _allowed_hosts(start_url)
-    try:
-        mapped = await crawler.amap_domain(
-            root,
-            DomainMapperConfig(
-                source="sitemap+robots+feed+homepage",
-                max_urls=-1,
-                # Discovery must be no more aggressive than the crawl itself.  A
-                # burst here was enough to trigger 429s before the first page had
-                # even been saved.
-                concurrency=1,
-                hits_per_sec=0.5,
-                extract_head=False,
-                filter_nonsense_urls=True,
-                soft_404_detection=True,
-                use_browser_for_homepage=False,
-            ),
-        )
-    except Exception:
-        return []
+async def _discover_current_urls(start_url: str) -> list[str]:
+    """Read sitemap URLs directly, without a second browser crawler.
 
-    urls: list[str] = []
-    for item in mapped or []:
-        url = item.get("url", "") if isinstance(item, dict) else ""
-        if not url:
-            continue
-        url = canonicalize_url(url)
-        if hostname_from_url(url) in allowed:
-            urls.append(url)
-    return sorted(set(urls))
+    Browser-based sitemap discovery is both slow and fragile on large publisher
+    sites.  Sitemaps are XML resources, so a single polite HTTP client gives us
+    the complete seed list before Chromium starts rendering pages.
+    """
+    allowed = _allowed_hosts(start_url)
+    sitemap_queue: deque[str] = deque([urljoin(start_url, "/sitemap.xml")])
+    seen_sitemaps: set[str] = set()
+    found: set[str] = set()
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(20.0),
+        headers={"User-Agent": "LiveDropHunter/1.0 (+https://github.com/mhvrt/crawl)"},
+    ) as client:
+        # robots.txt can advertise one or more sitemap indexes; /sitemap.xml is
+        # retained as the conservative fallback for sites without that directive.
+        try:
+            robots = await client.get(urljoin(start_url, "/robots.txt"))
+            if robots.is_success:
+                for line in robots.text.splitlines():
+                    key, _, value = line.partition(":")
+                    if key.strip().lower() == "sitemap" and value.strip():
+                        sitemap_queue.append(value.strip())
+        except httpx.HTTPError:
+            pass
+
+        while sitemap_queue:
+            sitemap_url = canonicalize_url(sitemap_queue.popleft())
+            if (
+                not sitemap_url
+                or hostname_from_url(sitemap_url) not in allowed
+                or sitemap_url in seen_sitemaps
+            ):
+                continue
+            seen_sitemaps.add(sitemap_url)
+            try:
+                response = await client.get(sitemap_url)
+                if not response.is_success:
+                    continue
+                root = ElementTree.fromstring(response.content)
+            except (httpx.HTTPError, ElementTree.ParseError):
+                continue
+
+            root_name = root.tag.rsplit("}", 1)[-1].lower()
+            for node in root.iter():
+                if node.tag.rsplit("}", 1)[-1].lower() != "loc" or not node.text:
+                    continue
+                location = canonicalize_url(node.text)
+                if not location:
+                    continue
+                if root_name == "sitemapindex":
+                    sitemap_queue.append(location)
+                elif hostname_from_url(location) in allowed:
+                    found.add(location)
+
+            # Sitemap retrieval counts as site traffic too; leave a stable gap
+            # rather than requesting an entire index in a burst.
+            if sitemap_queue:
+                await asyncio.sleep(1.0)
+
+    return sorted(found)
 
 
 async def _iterate_results(result_or_stream):
@@ -220,14 +253,14 @@ async def crawl_site(
         if use_current_discovery:
             progress("[discovery] seeding queue from current sitemap/robots/feed/homepage")
             try:
-                # Some broken/very large sitemap trees cause amap_domain to wait
-                # indefinitely.  DOM crawling from the homepage is a safe fallback.
+                # A broken/very large sitemap tree must not block normal DOM
+                # crawling from the homepage.
                 discovered = await asyncio.wait_for(
-                    _discover_current_urls(crawler, start_url), timeout=90
+                    _discover_current_urls(start_url), timeout=120
                 )
             except asyncio.TimeoutError:
                 discovered = []
-                progress("[discovery] timed out after 90s; continuing from homepage links")
+                progress("[discovery] timed out after 120s; continuing from homepage links")
             for url in discovered:
                 enqueue(url)
             seed_count = len(queued) + len(fetched_pages)
