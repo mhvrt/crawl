@@ -58,9 +58,14 @@ def backoff_seconds(
     cap_seconds: float = 300.0,
     retry_after: float | None = None,
 ) -> float:
-    """Return a conservative delay, honoring Retry-After when it is longer."""
+    """Return a conservative delay, honoring Retry-After when it is longer.
+
+    The local exponential delay is capped, but a server-provided Retry-After is
+    never shortened. If Retry-After exceeds the remaining job runtime, the caller
+    should checkpoint and resume later rather than issue another request early.
+    """
     attempt = max(1, int(attempt))
     exponential = min(cap_seconds, base_seconds * (2 ** (attempt - 1)))
     if retry_after is None:
         return exponential
-    return min(cap_seconds, max(exponential, max(0.0, float(retry_after))))
+    return max(exponential, max(0.0, float(retry_after)))
