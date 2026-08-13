@@ -15,7 +15,7 @@ on:
       max_runtime_minutes:
         description: "Maximum runtime per site before saving a resumable checkpoint"
         required: false
-        default: "45"
+        default: "300"
         type: string
       full_page_scan:
         description: "Scroll every page to trigger lazy/virtual content (slower)"
