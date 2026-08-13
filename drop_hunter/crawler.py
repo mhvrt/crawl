@@ -36,7 +36,7 @@ async def _discover_current_urls(crawler: AsyncWebCrawler, start_url: str) -> li
         mapped = await crawler.amap_domain(
             root,
             DomainMapperConfig(
-                source="sitemap+feed+homepage",
+                source="sitemap+robots+feed+homepage",
                 max_urls=-1,
                 concurrency=20,
                 hits_per_sec=5,
@@ -215,7 +215,7 @@ async def crawl_site(
 
     async with AsyncWebCrawler(config=browser_cfg) as crawler:
         if use_current_discovery:
-            progress("[discovery] seeding queue from current sitemap/feed/homepage")
+            progress("[discovery] seeding queue from current sitemap/robots/feed/homepage")
             discovered = await _discover_current_urls(crawler, start_url)
             for url in discovered:
                 enqueue(url)
@@ -223,7 +223,7 @@ async def crawl_site(
             progress(f"[discovery] total known URLs after seeding: {seed_count}")
 
         async def process_result(result) -> tuple[list[dict], list[str], dict | None]:
-            final_url = canonicalize_url(getattr(result, "url", "") or "")
+            final_url = canonicalize_url(getattr(result, "redirected_url", None) or getattr(result, "url", "") or "")
             if not final_url:
                 return [], [], {"url": "", "status": "", "error": "crawl returned no final URL"}
 
@@ -314,14 +314,19 @@ async def crawl_site(
                         errors.append(err)
                         _append_jsonl(errors_path, [err])
 
-                # Each input URL was attempted by arun_many. Mark requested URLs too so
-                # redirects cannot be re-enqueued forever. If the dispatcher returned no
-                # results at all, retry URLs individually instead.
-                if seen_results:
+                # Do not silently mark a whole batch complete if the dispatcher returns
+                # fewer CrawlResult objects than requested URLs. In exhaustive mode, retry
+                # unresolved inputs individually so a partial batch cannot hide missed pages.
+                if seen_results == len(batch):
                     fetched_pages.update(batch)
                 else:
+                    progress(
+                        f"[crawl] batch returned {seen_results}/{len(batch)} results; "
+                        "retrying unresolved URLs individually"
+                    )
                     for url in batch:
-                        await crawl_one_with_retry(url)
+                        if url not in fetched_pages:
+                            await crawl_one_with_retry(url)
             except Exception as exc:
                 progress(f"[crawl] batch failed ({type(exc).__name__}); retrying {len(batch)} URLs individually")
                 for url in batch:
