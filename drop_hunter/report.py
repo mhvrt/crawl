@@ -6,6 +6,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
 
+from .utils import is_valid_public_domain
+
 LINK_FIELDS = [
     "source_url", "source_domain", "source_status", "source_title",
     "target_url", "target_host", "target_domain", "anchor", "title_attr",
@@ -40,8 +42,8 @@ def read_csv(path: Path) -> list[dict]:
 def summarize_domains(link_rows: list[dict]) -> list[dict]:
     grouped: dict[str, list[dict]] = defaultdict(list)
     for row in link_rows:
-        domain = row.get("target_domain", "")
-        if domain:
+        domain = str(row.get("target_domain", "") or "").strip().lower().rstrip(".")
+        if is_valid_public_domain(domain):
             grouped[domain].append(row)
 
     output = []
