@@ -9,6 +9,7 @@ on:
       - "main.py"
       - "requirements.txt"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/crawl-sites.yml"
       - ".github/workflows/crawler-benchmark.yml"
   pull_request:
     paths:
@@ -16,6 +17,7 @@ on:
       - "tests/**"
       - "main.py"
       - "requirements.txt"
+      - ".github/workflows/crawl-sites.yml"
       - ".github/workflows/crawler-benchmark.yml"
 
 permissions:

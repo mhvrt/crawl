@@ -78,7 +78,15 @@ Maximum per single GitHub matrix workflow is 256 site jobs. For larger lists, sp
 
 ## Resume
 
-v3 uploads each site's whole `output/` as a per-site artifact. Supply a previous v3 `resume_run_id` to restore that site's artifact/checkpoint and continue a partial crawl.
+v3 uploads each site's whole `output/` as a per-site artifact. With the default
+`max_pages=0` and `auto_resume=true`, an incomplete five-hour crawl automatically
+starts another workflow run from that artifact/checkpoint. The chain stops only
+when the site's discoverable URL queue is empty, or when the configurable
+`max_continuations` safety limit is reached (24 runs by default).
+
+Automatic continuation is intentionally disabled when `max_pages` is non-zero,
+because a cumulative page cap is not a full-site crawl. To continue an older or
+manually stopped run, supply its workflow run ID as `resume_run_id`.
 
 ## Benchmarking crawler changes
 
