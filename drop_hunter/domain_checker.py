@@ -9,6 +9,8 @@ import dns.exception
 import dns.resolver
 import httpx
 
+from .utils import is_valid_public_domain
+
 IANA_RDAP_BOOTSTRAP = "https://data.iana.org/rdap/dns.json"
 
 
@@ -144,12 +146,18 @@ async def _check_one(domain: str, client: httpx.AsyncClient, mapping: dict[str, 
 
 
 async def check_domains(domains: list[str], concurrency: int = 8) -> list[dict[str, Any]]:
+    # Malformed/single-label/IP targets are not domain-registration candidates and
+    # must never consume DNS/RDAP requests.
+    valid_domains = sorted({d.strip().lower().rstrip(".") for d in domains if is_valid_public_domain(d)})
+    if not valid_domains:
+        return []
+
     headers = {"User-Agent": "live-drop-hunter/0.3 (+GitHub Actions)"}
     limits = httpx.Limits(max_connections=max(4, concurrency), max_keepalive_connections=max(4, concurrency))
     async with httpx.AsyncClient(headers=headers, limits=limits) as client:
         mapping = await load_rdap_bootstrap(client)
         semaphore = asyncio.Semaphore(max(1, concurrency))
-        tasks = [_check_one(d, client, mapping, semaphore) for d in sorted(set(domains))]
+        tasks = [_check_one(d, client, mapping, semaphore) for d in valid_domains]
         results: list[dict[str, Any]] = []
         for fut in asyncio.as_completed(tasks):
             status = await fut
