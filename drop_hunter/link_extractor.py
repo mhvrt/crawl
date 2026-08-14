@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlsplit
 
 from lxml import html as lxml_html
 
-from .utils import canonicalize_url, hostname_from_url, registrable_domain
+from .utils import canonicalize_url, hostname_from_url, is_valid_public_domain, registrable_domain
 
 QUALIFYING_REL = {"nofollow", "sponsored", "ugc"}
 # These are resources, not HTML pages we want to enqueue for crawling.
@@ -130,7 +130,11 @@ def extract_external_links(
         target_url = canonicalize_url(absolute)
         target_host = hostname_from_url(target_url)
         target_domain = registrable_domain(target_host)
-        if not target_domain or target_domain == source_domain:
+        if (
+            not target_domain
+            or target_domain == source_domain
+            or not is_valid_public_domain(target_domain)
+        ):
             continue
 
         rel_tokens = sorted({x.lower() for x in (a.get("rel") or "").split() if x.strip()})
