@@ -37,10 +37,25 @@ on:
         required: false
         default: ""
         type: string
+      auto_resume:
+        description: "Automatically start another checkpointed run until the site queue is empty"
+        required: false
+        default: true
+        type: boolean
+      continuation_index:
+        description: "Internal auto-resume counter (leave at 0 for a new crawl)"
+        required: false
+        default: "0"
+        type: string
+      max_continuations:
+        description: "Safety limit for automatic five-hour continuation runs"
+        required: false
+        default: "24"
+        type: string
 
 permissions:
   contents: read
-  actions: read
+  actions: write
 
 jobs:
   prepare:
@@ -61,6 +76,9 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 340
+    concurrency:
+      group: full-crawl-${{ matrix.site.slug }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJSON(inputs.max_parallel) }}
@@ -88,7 +106,6 @@ jobs:
 
       - name: Restore previous checkpoint/artifact
         if: ${{ inputs.resume_run_id != '' }}
-        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: live-drop-hunter-${{ matrix.site.slug }}-${{ inputs.resume_run_id }}
@@ -130,6 +147,23 @@ jobs:
           fi
           python main.py "${args[@]}"
 
+      - name: Inspect crawl completion state
+        id: crawl_state
+        if: always()
+        env:
+          TARGET_SLUG: ${{ matrix.site.slug }}
+        run: |
+          stats_file="output/$TARGET_SLUG/stats.json"
+          if [ ! -f "$stats_file" ]; then
+            echo "state_found=false" >> "$GITHUB_OUTPUT"
+            echo "crawl_complete=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Crawl stats were not produced; automatic continuation is disabled."
+            exit 0
+          fi
+          echo "state_found=true" >> "$GITHUB_OUTPUT"
+          echo "crawl_complete=$(jq -r '.crawl_complete == true' "$stats_file")" >> "$GITHUB_OUTPUT"
+          echo "remaining_queue_urls=$(jq -r '.remaining_queue_urls // 0' "$stats_file")" >> "$GITHUB_OUTPUT"
+
       - name: Upload reports/checkpoint
         if: always()
         uses: actions/upload-artifact@v4
@@ -138,6 +172,47 @@ jobs:
           path: output/**
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Start next checkpointed continuation
+        if: >-
+          ${{ always()
+              && inputs.auto_resume
+              && inputs.max_pages == '0'
+              && steps.crawl.outcome == 'success'
+              && steps.crawl_state.outputs.state_found == 'true'
+              && steps.crawl_state.outputs.crawl_complete != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_DOMAIN: ${{ matrix.site.domain }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+          MAX_RUNTIME_MINUTES: ${{ inputs.max_runtime_minutes }}
+          FULL_PAGE_SCAN: ${{ inputs.full_page_scan }}
+          WRITE_RAW_LINKS: ${{ inputs.write_raw_links_to_sheets }}
+          CONTINUATION_INDEX: ${{ inputs.continuation_index }}
+          MAX_CONTINUATIONS: ${{ inputs.max_continuations }}
+        run: |
+          if ! [[ "$CONTINUATION_INDEX" =~ ^[0-9]+$ && "$MAX_CONTINUATIONS" =~ ^[0-9]+$ ]]; then
+            echo "::error::Continuation counters must be non-negative integers."
+            exit 1
+          fi
+          next_index=$((CONTINUATION_INDEX + 1))
+          if (( next_index > MAX_CONTINUATIONS )); then
+            echo "::error::Automatic continuation safety limit reached with ${{ steps.crawl_state.outputs.remaining_queue_urls }} URLs still queued."
+            exit 1
+          fi
+          gh workflow run crawl-sites.yml \
+            --ref "$GITHUB_REF_NAME" \
+            --field domains="$TARGET_DOMAIN" \
+            --field max_pages="$MAX_PAGES" \
+            --field max_runtime_minutes="$MAX_RUNTIME_MINUTES" \
+            --field full_page_scan="$FULL_PAGE_SCAN" \
+            --field write_raw_links_to_sheets="$WRITE_RAW_LINKS" \
+            --field max_parallel="1" \
+            --field resume_run_id="$GITHUB_RUN_ID" \
+            --field auto_resume="true" \
+            --field continuation_index="$next_index" \
+            --field max_continuations="$MAX_CONTINUATIONS"
+          echo "Queued continuation $next_index/$MAX_CONTINUATIONS from run $GITHUB_RUN_ID."
 
       - name: Crash notification
         if: failure()
