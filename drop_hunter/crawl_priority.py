@@ -27,9 +27,9 @@ def section_key(url: str) -> str:
     parts = [p.lower() for p in urlsplit(url).path.split("/") if p]
     if not parts:
         return "/"
-    # Two levels separate broad sections such as /crypto/news without exploding
-    # article slugs into thousands of independent buckets.
-    return "/" + "/".join(parts[:2])
+    # Learn at the top-level section (/analysis, /crypto, /company). Using an
+    # article slug here would fragment the signal and make adaptive ordering inert.
+    return "/" + parts[0]
 
 
 def base_priority(url: str) -> float:
@@ -58,7 +58,7 @@ class SectionYield:
 
 
 class YieldPriorityQueue:
-    """Small dynamic priority queue optimized for discovery yield, not FIFO order.
+    """Dynamic priority queue optimized for discovery yield, not FIFO order.
 
     Scores are recomputed when an item is popped, so already queued URLs benefit
     immediately when their section starts producing new external domains.
