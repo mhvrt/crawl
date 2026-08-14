@@ -314,12 +314,14 @@ async def crawl_site(
             checkpoint,
             json.dumps(
                 {
-                    "schema_version": 5,
+                    "schema_version": 6,
                     "start_url": start_url,
-                    "fetched_urls": sorted(live),
-                    "successful_urls": sorted(live),
-                    "terminal_urls": sorted(terminal),
-                    "pending_urls": list(queue),
+                    # Ordering these large collections is not required for resume
+                    # and made every checkpoint unnecessarily O(n log n).
+                    "fetched_urls": list(live),
+                    "successful_urls": list(live),
+                    "terminal_urls": list(terminal),
+                    "pending_urls": queue.pending_urls(),
                     "deferred_urls": list(deferred.values()),
                     "successful_count": len(live),
                     "terminal_count": len(terminal),
@@ -761,6 +763,8 @@ def _stats(
     new_domains_this_run,
     seen_target_domains,
 ):
+    runtime_seconds = max(0.001, time.time() - started_epoch)
+    runtime_hours = runtime_seconds / 3600
     remaining = len(queue) + len(deferred)
     yield_stats = queue.export_stats()
     ranked_sections = sorted(
@@ -806,7 +810,10 @@ def _stats(
         "recovered_retryable_urls": recovered,
         "skipped_trap_urls": skipped_traps,
         "top_yield_sections": ranked_sections,
-        "runtime_seconds": round(time.time() - started_epoch, 2),
+        "runtime_seconds": round(runtime_seconds, 2),
+        "attempted_pages_per_hour": round(pages_attempted_this_run / runtime_hours, 2),
+        "successful_pages_per_hour": round(http_successes / runtime_hours, 2),
+        "new_external_domains_per_hour": round(new_domains_this_run / runtime_hours, 2),
         "crawl_complete": remaining == 0,
         "stopped_by_runtime_limit": stopped_runtime,
         "stopped_by_page_limit": stopped_page,

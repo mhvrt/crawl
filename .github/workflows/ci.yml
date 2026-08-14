@@ -9,12 +9,14 @@ on:
       - "main.py"
       - "requirements.txt"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/crawler-benchmark.yml"
   pull_request:
     paths:
       - "drop_hunter/**"
       - "tests/**"
       - "main.py"
       - "requirements.txt"
+      - ".github/workflows/crawler-benchmark.yml"
 
 permissions:
   contents: read

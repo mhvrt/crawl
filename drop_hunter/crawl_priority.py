@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -7,13 +8,15 @@ from urllib.parse import urlsplit
 HIGH_VALUE_SEGMENTS = {
     "about", "company", "companies", "resource", "resources", "research",
     "report", "reports", "guide", "guides", "tools", "tool", "partners",
-    "partner", "press", "media", "directory", "directories", "links",
-    "reference", "references", "academy", "education", "learn",
+    "partner", "press", "press-releases", "media", "directory", "directories",
+    "links", "reference", "references", "academy", "education", "learn",
+    "info",
 }
 CONTENT_SEGMENTS = {
     "article", "articles", "blog", "blogs", "news", "analysis", "crypto",
-    "insights", "insight", "stories", "story", "features", "feature",
-    "opinion", "reviews", "review", "markets", "market",
+    "cryptocurrencies", "insights", "insight", "stories", "story",
+    "features", "feature", "opinion", "reviews", "review", "markets",
+    "market",
 }
 LOW_VALUE_SEGMENTS = {
     "account", "accounts", "login", "signin", "sign-in", "signup", "sign-up",
@@ -60,14 +63,16 @@ class SectionYield:
 class YieldPriorityQueue:
     """Dynamic priority queue optimized for discovery yield, not FIFO order.
 
-    Scores are recomputed when an item is popped, so already queued URLs benefit
-    immediately when their section starts producing new external domains.
-    Exhaustiveness is preserved: low-yield URLs remain queued and are processed
-    after higher-yield work.
+    URLs are kept in small per-section heaps. Choosing the next section scans the
+    section heads rather than every queued URL, so a 100k URL sitemap does not
+    turn every pop into a 100k-item scan. Learned section yield is applied when a
+    section is selected, so already queued URLs are reprioritized immediately.
+    Exhaustiveness is preserved: low-yield URLs remain queued.
     """
 
     def __init__(self) -> None:
         self._items: dict[str, int] = {}
+        self._buckets: dict[str, list[tuple[float, int, str]]] = {}
         self._serial = 0
         self._sections: dict[str, SectionYield] = {}
 
@@ -76,6 +81,11 @@ class YieldPriorityQueue:
             return
         self._serial += 1
         self._items[url] = self._serial
+        key = section_key(url)
+        heapq.heappush(
+            self._buckets.setdefault(key, []),
+            (base_priority(url), self._serial, url),
+        )
 
     def __len__(self) -> int:
         return len(self._items)
@@ -84,8 +94,9 @@ class YieldPriorityQueue:
         return bool(self._items)
 
     def __iter__(self):
-        for url in self.ordered():
-            yield url
+        # Checkpoint restore recomputes priorities from section stats, so pending
+        # URLs only need a stable, linear-time snapshot here.
+        return iter(self.pending_urls())
 
     def score(self, url: str) -> float:
         stats = self._sections.get(section_key(url))
@@ -96,13 +107,50 @@ class YieldPriorityQueue:
         return base_priority(url) - learned_boost
 
     def ordered(self) -> list[str]:
+        """Return a fully ranked debug view; checkpoints should use pending_urls."""
         return sorted(self._items, key=lambda u: (self.score(u), self._items[u]))
+
+    def pending_urls(self) -> list[str]:
+        """Return all queued URLs in insertion order without sorting them."""
+        return list(self._items)
+
+    def _prune_bucket(self, key: str) -> None:
+        bucket = self._buckets.get(key)
+        if not bucket:
+            return
+        while bucket:
+            _priority, serial, url = bucket[0]
+            if self._items.get(url) == serial:
+                break
+            heapq.heappop(bucket)
+        if not bucket:
+            self._buckets.pop(key, None)
+
+    def _section_boost(self, key: str) -> float:
+        stats = self._sections.get(key)
+        return min(30.0, (stats.rate * 12.0) if stats else 0.0)
 
     def popleft(self) -> str:
         if not self._items:
             raise IndexError("pop from empty YieldPriorityQueue")
-        url = min(self._items, key=lambda u: (self.score(u), self._items[u]))
-        self._items.pop(url, None)
+
+        candidates: list[tuple[float, int, str]] = []
+        for key in list(self._buckets):
+            self._prune_bucket(key)
+            bucket = self._buckets.get(key)
+            if bucket:
+                priority, serial, _url = bucket[0]
+                candidates.append((priority - self._section_boost(key), serial, key))
+
+        if not candidates:
+            raise RuntimeError("priority queue indexes are inconsistent")
+
+        _score, _serial, key = min(candidates)
+        _priority, serial, url = heapq.heappop(self._buckets[key])
+        if self._items.get(url) != serial:
+            raise RuntimeError("priority queue returned a stale item")
+        del self._items[url]
+        self._prune_bucket(key)
         return url
 
     def record_result(self, url: str, new_domains: int) -> None:

@@ -13,6 +13,19 @@ def test_priority_puts_resource_pages_before_utility_pages():
     assert section_key("https://example.com/analysis/some-article") == "/analysis"
 
 
+def test_fxstreet_high_yield_sections_start_before_news_and_account():
+    info = "https://www.fxstreet.com/info/advertising"
+    company = "https://www.fxstreet.com/company/about"
+    crypto = "https://www.fxstreet.com/cryptocurrencies/news/bitcoin"
+    news = "https://www.fxstreet.com/news/market-update"
+    account = "https://www.fxstreet.com/account/login"
+
+    assert base_priority(info) < base_priority(news)
+    assert base_priority(company) < base_priority(news)
+    assert base_priority(crypto) <= base_priority(news)
+    assert base_priority(news) < base_priority(account)
+
+
 def test_yield_learning_reorders_existing_queue():
     q = YieldPriorityQueue()
     generic = "https://example.com/products/a"
@@ -41,6 +54,24 @@ def test_priority_stats_roundtrip():
     restored = YieldPriorityQueue()
     restored.load_stats(payload)
     assert restored.export_stats() == payload
+
+
+def test_checkpoint_snapshot_does_not_sort_or_score_all_urls(monkeypatch):
+    q = YieldPriorityQueue()
+    urls = [f"https://example.com/news/{i}" for i in range(100)]
+    for url in urls:
+        q.append(url)
+
+    monkeypatch.setattr(q, "score", lambda _url: (_ for _ in ()).throw(AssertionError))
+    assert q.pending_urls() == urls
+
+
+def test_section_heap_preserves_fifo_within_equal_priority():
+    q = YieldPriorityQueue()
+    urls = [f"https://example.com/news/{i}" for i in range(5)]
+    for url in urls:
+        q.append(url)
+    assert [q.popleft() for _ in urls] == urls
 
 
 def test_public_domain_validation_rejects_scheme_fragments_and_ips():

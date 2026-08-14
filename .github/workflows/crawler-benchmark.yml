@@ -1,0 +1,67 @@
+name: Crawler benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: "One domain or URL to benchmark"
+        required: true
+        default: "https://www.fxstreet.com"
+        type: string
+      max_pages:
+        description: "Maximum successful/terminal pages"
+        required: true
+        default: "1000"
+        type: string
+      max_runtime_minutes:
+        description: "Stop and save a checkpoint after this many minutes"
+        required: true
+        default: "90"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          crawl4ai-setup
+      - name: Run tests
+        run: pytest -q
+      - name: Benchmark HTTP-first crawl
+        env:
+          TARGET_DOMAIN: ${{ inputs.domain }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+          MAX_RUNTIME_MINUTES: ${{ inputs.max_runtime_minutes }}
+        run: |
+          python main.py "$TARGET_DOMAIN" \
+            --run-id "benchmark-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --max-pages "$MAX_PAGES" \
+            --max-runtime-minutes "$MAX_RUNTIME_MINUTES" \
+            --benchmark
+      - name: Show benchmark metrics
+        if: always()
+        run: |
+          stats_file=$(find output -name stats.json -print -quit)
+          if [ -n "$stats_file" ]; then
+            jq '{pages_attempted_this_run, http_successes_this_run, attempted_pages_per_hour, successful_pages_per_hour, unique_external_domains_seen, new_external_domains_this_run, new_external_domains_per_hour, browser_fallback_attempts, rate_limit_events, runtime_seconds, top_yield_sections}' "$stats_file"
+          fi
+      - name: Upload benchmark artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawler-benchmark-${{ github.run_id }}
+          path: output/**
+          if-no-files-found: warn
+          retention-days: 30

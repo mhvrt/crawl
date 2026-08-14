@@ -79,3 +79,24 @@ Maximum per single GitHub matrix workflow is 256 site jobs. For larger lists, sp
 ## Resume
 
 v3 uploads each site's whole `output/` as a per-site artifact. Supply a previous v3 `resume_run_id` to restore that site's artifact/checkpoint and continue a partial crawl.
+
+## Benchmarking crawler changes
+
+Use **Actions → Crawler benchmark → Run workflow** for acquisition benchmarks.
+The default run crawls up to 1,000 pages from FXStreet with the production
+HTTP-first scheduler, but skips DNS/RDAP, Google Sheets and Telegram so those
+services do not distort crawler throughput.
+
+Compare these fields from `stats.json` between runs:
+
+- `attempted_pages_per_hour`
+- `successful_pages_per_hour`
+- `new_external_domains_per_hour`
+- `unique_external_domains_seen`
+- `browser_fallback_attempts`
+- `rate_limit_events`
+- `top_yield_sections`
+
+The benchmark still uploads all link CSVs and the checkpoint as a GitHub
+artifact. Run it from a clean start rather than resuming an older crawl when
+comparing scheduler/downloader changes.

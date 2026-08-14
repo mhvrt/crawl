@@ -32,6 +32,11 @@ def parse_args():
     p.add_argument("--rdap-concurrency", type=int, default=6)
     p.add_argument("--write-raw-links-to-sheets", action="store_true")
     p.add_argument("--resume", action="store_true")
+    p.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Measure crawl acquisition only; skip RDAP, Sheets and Telegram I/O",
+    )
     return p.parse_args()
 
 
@@ -46,29 +51,31 @@ async def main_async():
 
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     tg_chat = os.getenv("TELEGRAM_CHAT_ID", "")
-    await telegram_send_message(tg_token, tg_chat, f"🚀 Crawl started\n{url}\nRun: {run_id}")
+    if not args.benchmark:
+        await telegram_send_message(tg_token, tg_chat, f"🚀 Crawl started\n{url}\nRun: {run_id}")
 
     # Make the source site visible in the Dashboard immediately.  Previously the
     # first Sheets write happened only after a potentially multi-hour full crawl,
     # which looked exactly like a stalled workflow.
-    try:
-        await asyncio.to_thread(
-            sync_run_to_google_sheets,
-            run_id=run_id,
-            source_site=url,
-            stats={
-                "crawl_in_progress": True,
-                "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "pages_crawled": 0,
-                "remaining_queue_urls": 0,
-                "outbound_link_rows": 0,
-                "crawl_errors": 0,
-                "runtime_seconds": 0,
-            },
-            domains=[], drops=[], links=[], errors=[], write_raw_links=False,
-        )
-    except Exception as exc:
-        print(f"[sheets] initial RUNNING status was not written: {type(exc).__name__}: {exc}")
+    if not args.benchmark:
+        try:
+            await asyncio.to_thread(
+                sync_run_to_google_sheets,
+                run_id=run_id,
+                source_site=url,
+                stats={
+                    "crawl_in_progress": True,
+                    "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "pages_crawled": 0,
+                    "remaining_queue_urls": 0,
+                    "outbound_link_rows": 0,
+                    "crawl_errors": 0,
+                    "runtime_seconds": 0,
+                },
+                domains=[], drops=[], links=[], errors=[], write_raw_links=False,
+            )
+        except Exception as exc:
+            print(f"[sheets] initial RUNNING status was not written: {type(exc).__name__}: {exc}")
 
     links, stats = await crawl_site(
         url,
@@ -87,7 +94,12 @@ async def main_async():
     domains_path = run_dir / "domains_summary.csv"
     write_csv(domains_path, summary, DOMAIN_FIELDS)
 
-    checks = await check_domains([r["target_domain"] for r in summary], concurrency=args.rdap_concurrency)
+    checks = []
+    if not args.benchmark:
+        checks = await check_domains(
+            [r["target_domain"] for r in summary],
+            concurrency=args.rdap_concurrency,
+        )
     check_map = {r["domain"]: r for r in checks}
     write_csv(run_dir / "domain_status.csv", checks, CHECK_FIELDS)
 
@@ -113,6 +125,7 @@ async def main_async():
     stats.update({
         "run_id": run_id,
         "source_site": url,
+        "benchmark_mode": args.benchmark,
         "unique_external_domains": len(summary),
         "follow_link_rows": sum(1 for r in links if r.get("follow")),
         "nofollow_link_rows": sum(1 for r in links if r.get("nofollow")),
@@ -120,21 +133,22 @@ async def main_async():
         "high_confidence_drops": sum(1 for r in drops if r.get("confidence") == "HIGH"),
     })
 
-    sheets_result = {"enabled": False}
-    try:
-        sheets_result = await asyncio.to_thread(
-            sync_run_to_google_sheets,
-            run_id=run_id,
-            source_site=url,
-            stats=stats,
-            domains=summary,
-            drops=drops,
-            links=links,
-            errors=errors,
-            write_raw_links=args.write_raw_links_to_sheets,
-        )
-    except Exception as exc:
-        sheets_result = {"enabled": False, "error": f"{type(exc).__name__}: {exc}"}
+    sheets_result = {"enabled": False, "skipped_for_benchmark": args.benchmark}
+    if not args.benchmark:
+        try:
+            sheets_result = await asyncio.to_thread(
+                sync_run_to_google_sheets,
+                run_id=run_id,
+                source_site=url,
+                stats=stats,
+                domains=summary,
+                drops=drops,
+                links=links,
+                errors=errors,
+                write_raw_links=args.write_raw_links_to_sheets,
+            )
+        except Exception as exc:
+            sheets_result = {"enabled": False, "error": f"{type(exc).__name__}: {exc}"}
     stats["google_sheets"] = sheets_result
     write_json(run_dir / "stats.json", stats)
 
@@ -169,8 +183,9 @@ async def main_async():
     else:
         text += "\nℹ️ Google Sheets export not configured"
 
-    await telegram_send_message(tg_token, tg_chat, text)
-    await telegram_send_document(tg_token, tg_chat, zip_path, caption=f"Report: {slug}")
+    if not args.benchmark:
+        await telegram_send_message(tg_token, tg_chat, text)
+        await telegram_send_document(tg_token, tg_chat, zip_path, caption=f"Report: {slug}")
 
     print(json.dumps(stats, ensure_ascii=False, indent=2))
     print(f"REPORT_ZIP={zip_path}")
