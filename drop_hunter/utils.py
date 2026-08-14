@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import re
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urldefrag, urlsplit, urlunsplit
@@ -15,6 +16,7 @@ _TRACKING_PARAMS = {
     "ref", "ref_src", "igshid", "phpsessid", "jsessionid", "sessionid",
     "sid", "sessid", "session_id", "cf_clearance",
 }
+_DOMAIN_LABEL_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$", re.I)
 
 
 def ensure_url(value: str) -> str:
@@ -55,14 +57,43 @@ def registrable_domain(host_or_url: str) -> str:
     host = hostname_from_url(host_or_url) if "://" in host_or_url else host_or_url.lower().rstrip(".")
     if not host:
         return ""
-    if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", host) or ":" in host:
+    try:
+        ipaddress.ip_address(host)
         return host
+    except ValueError:
+        pass
     if tldextract is not None:
         ext = tldextract.TLDExtract(suffix_list_urls=None)(host)
         return ext.top_domain_under_public_suffix or host
     # Fallback is intentionally conservative; production installs tldextract.
     labels = host.split(".")
     return ".".join(labels[-2:]) if len(labels) >= 2 else host
+
+
+def is_valid_public_domain(domain: str) -> bool:
+    """Return True only for a syntactically valid public registrable DNS domain.
+
+    This deliberately rejects IPs, single-label hosts, localhost-like values and
+    malformed scheme fragments such as ``https``/``ttp``.  Production installs
+    tldextract, so a known public suffix is also required before RDAP/DNS checks.
+    """
+    value = (domain or "").strip().lower().rstrip(".")
+    if not value or len(value) > 253 or "://" in value or "/" in value or "@" in value:
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return False
+    except ValueError:
+        pass
+    labels = value.split(".")
+    if len(labels) < 2 or any(not _DOMAIN_LABEL_RE.match(label) for label in labels):
+        return False
+    if tldextract is not None:
+        ext = tldextract.TLDExtract(suffix_list_urls=None)(value)
+        return bool(ext.domain and ext.suffix and ext.top_domain_under_public_suffix == value)
+    # Static-test fallback: require at least a plausible alphabetic/punycode TLD.
+    tld = labels[-1]
+    return (len(tld) >= 2 and tld.isalpha()) or tld.startswith("xn--")
 
 
 def safe_slug(value: str) -> str:
