@@ -87,6 +87,7 @@ def test_malformed_external_links_are_not_emitted():
     <html><body>
       <a href="https://https//www.fxstreet.com/bad">bad https</a>
       <a href="https://ttp//pubads.g.doubleclick.net/bad">bad ttp</a>
+      <a href="https://example.com: New capital or clever shuffle">bad port</a>
       <a href="https://valid-example.com/page">valid</a>
     </body></html>
     """

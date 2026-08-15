@@ -88,7 +88,12 @@ def extract_internal_urls(source_url: str, html_text: str, allowed_hosts: set[st
         parts = urlsplit(absolute)
         if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
             continue
-        target = canonicalize_url(absolute)
+        try:
+            target = canonicalize_url(absolute)
+        except ValueError:
+            # Some pages contain malformed hrefs such as ``https://host: text``.
+            # They must not abort an otherwise valid crawl.
+            continue
         if hostname_from_url(target) not in allowed_hosts:
             continue
         if not _looks_like_page(target):
@@ -127,7 +132,11 @@ def extract_external_links(
         if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
             continue
 
-        target_url = canonicalize_url(absolute)
+        try:
+            target_url = canonicalize_url(absolute)
+        except ValueError:
+            # Ignore malformed external hrefs and continue extracting the page.
+            continue
         target_host = hostname_from_url(target_url)
         target_domain = registrable_domain(target_host)
         if (
