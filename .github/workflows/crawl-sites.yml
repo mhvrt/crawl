@@ -154,15 +154,35 @@ jobs:
           TARGET_SLUG: ${{ matrix.site.slug }}
         run: |
           stats_file="output/$TARGET_SLUG/stats.json"
-          if [ ! -f "$stats_file" ]; then
+          checkpoint_file="output/$TARGET_SLUG/crawl_checkpoint.json"
+          if [ ! -f "$stats_file" ] && [ ! -f "$checkpoint_file" ]; then
             echo "state_found=false" >> "$GITHUB_OUTPUT"
             echo "crawl_complete=false" >> "$GITHUB_OUTPUT"
             echo "::warning::Crawl stats were not produced; automatic continuation is disabled."
             exit 0
           fi
+          stats_complete=false
+          if [ -f "$stats_file" ]; then
+            stats_complete=$(jq -r '.crawl_complete == true' "$stats_file")
+          fi
+          if [ "$stats_complete" != "true" ] && [ ! -f "$checkpoint_file" ]; then
+            echo "state_found=false" >> "$GITHUB_OUTPUT"
+            echo "crawl_complete=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::An incomplete crawl has no checkpoint; automatic continuation is disabled."
+            exit 0
+          fi
           echo "state_found=true" >> "$GITHUB_OUTPUT"
-          echo "crawl_complete=$(jq -r '.crawl_complete == true' "$stats_file")" >> "$GITHUB_OUTPUT"
-          echo "remaining_queue_urls=$(jq -r '.remaining_queue_urls // 0' "$stats_file")" >> "$GITHUB_OUTPUT"
+          checkpoint_pending=0
+          if [ -f "$checkpoint_file" ]; then
+            checkpoint_pending=$(jq -r '(.pending_urls // []) | length' "$checkpoint_file")
+          fi
+          if [ "$stats_complete" = "true" ] || { [ -f "$checkpoint_file" ] && [ "$checkpoint_pending" -eq 0 ]; }; then
+            echo "crawl_complete=true" >> "$GITHUB_OUTPUT"
+            echo "remaining_queue_urls=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "crawl_complete=false" >> "$GITHUB_OUTPUT"
+            echo "remaining_queue_urls=$checkpoint_pending" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload reports/checkpoint
         if: always()
@@ -178,7 +198,7 @@ jobs:
           ${{ always()
               && inputs.auto_resume
               && inputs.max_pages == '0'
-              && steps.crawl.outcome == 'success'
+              && (steps.crawl.outcome == 'success' || steps.crawl.outcome == 'cancelled')
               && steps.crawl_state.outputs.state_found == 'true'
               && steps.crawl_state.outputs.crawl_complete != 'true' }}
         env:
