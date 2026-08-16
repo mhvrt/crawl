@@ -1,4 +1,4 @@
-# Live Drop Hunter v3
+# Live Drop Hunter v4
 
 Exhaustive current-site outbound-link crawler for finding target domains that may have dropped.
 
@@ -8,7 +8,7 @@ Paste one or many domains into **Actions → Crawl sites → Run workflow**. Eac
 
 For each site the crawler:
 
-1. seeds the queue from homepage + current sitemap/feed/homepage discovery;
+1. seeds the queue from homepage, current sitemap/robots discovery, Wayback CDX and multiple Common Crawl indexes;
 2. follows every newly discovered same-site internal URL until the queue is exhausted (or runtime/page limit is reached);
 3. extracts every external DOM `<a>` link from every live source page;
 4. stores source URL, target URL/domain, anchor, `rel`, follow/nofollow/sponsored/ugc, approximate DOM position and XPath;
@@ -17,7 +17,15 @@ For each site the crawler:
 7. sends Telegram results and a ZIP artifact;
 8. optionally appends summarized results into one shared Google Sheet.
 
-No Wayback/Common Crawl historical URLs are used. A true orphan page that is not linked anywhere and is absent from current discovery sources cannot be discovered by any normal crawler.
+Archive indexes are discovery sources: every resulting URL is fetched from the
+live site before its links enter the current report. This finds live orphan pages
+without mixing stale archived links into current results. The source of every
+queued URL and its crawl state are preserved in `crawl_state.sqlite3`.
+
+Static HTML uses a pooled HTTP/2 downloader with six concurrent requests by
+default. Chromium is started only for a page that looks like a client-rendered
+JavaScript shell. HTTP 429/503 opens a site-wide backoff circuit and preserves
+the queue for continuation.
 
 ## Google Sheets structure
 
@@ -52,11 +60,17 @@ If Google secrets are absent or invalid, crawling still completes; Sheets export
 
 - `all_outbound.csv`
 - `domains_summary.csv`
+- `current_outbound.csv`
+- `current_domains.csv`
+- `historical_outbound.csv` (reserved for archive-body enrichment)
+- `historical_domains.csv` (reserved for archive-body enrichment)
+- `combined_domains.csv`
 - `domain_status.csv`
 - `drop_candidates.csv`
 - `crawl_errors.csv`
 - `stats.json`
 - `crawl_checkpoint.json`
+- `crawl_state.sqlite3`
 
 ## Multi-domain input
 
@@ -78,8 +92,8 @@ Maximum per single GitHub matrix workflow is 256 site jobs. For larger lists, sp
 
 ## Resume
 
-v3 uploads each site's whole `output/` as a per-site artifact. With the default
-`max_pages=0` and `auto_resume=true`, an incomplete five-hour crawl automatically
+v4 uploads each site's whole `output/` as a per-site artifact. With the default
+`max_pages=0` and `auto_resume=true`, an incomplete 270-minute crawl automatically
 starts another workflow run from that artifact/checkpoint. The chain stops only
 when the site's discoverable URL queue is empty, or when the configurable
 `max_continuations` safety limit is reached (24 runs by default).
@@ -87,6 +101,10 @@ when the site's discoverable URL queue is empty, or when the configurable
 Automatic continuation is intentionally disabled when `max_pages` is non-zero,
 because a cumulative page cap is not a full-site crawl. To continue an older or
 manually stopped run, supply its workflow run ID as `resume_run_id`.
+
+SQLite is authoritative for v4 resume and is committed after each HTTP batch.
+The JSON checkpoint remains for compatibility and workflow inspection and is
+refreshed every 30 seconds plus at every clean exit.
 
 ## Benchmarking crawler changes
 
@@ -106,5 +124,6 @@ Compare these fields from `stats.json` between runs:
 - `top_yield_sections`
 
 The benchmark still uploads all link CSVs and the checkpoint as a GitHub
-artifact. Run it from a clean start rather than resuming an older crawl when
-comparing scheduler/downloader changes.
+artifact. Archive discovery is disabled in the benchmark so index latency and
+seed volume do not distort HTTP throughput. Run it from a clean start rather
+than resuming an older crawl when comparing scheduler/downloader changes.

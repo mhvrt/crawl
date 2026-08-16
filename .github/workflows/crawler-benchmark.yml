@@ -54,6 +54,7 @@ jobs:
             --run-id "benchmark-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --max-pages "$MAX_PAGES" \
             --max-runtime-minutes "$MAX_RUNTIME_MINUTES" \
+            --no-archive-discovery \
             --benchmark
       - name: Show benchmark metrics
         if: always()

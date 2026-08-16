@@ -21,6 +21,9 @@ class FakeCrawler:
     async def arun_many(self, urls, **kwargs):
         return [self.results[url] for url in urls]
 
+    async def fetch_many(self, urls):
+        return [self.results[url] for url in urls]
+
 
 def result(url, status=200, html="<html><body><a href='https://outside.example/x'>x</a></body></html>", **kwargs):
     return SimpleNamespace(
@@ -61,6 +64,10 @@ def test_429_is_not_fetched_and_is_saved_for_resume(tmp_path, monkeypatch):
         )
     }
     monkeypatch.setattr(native_crawler, "AsyncWebCrawler", FakeCrawler)
+    monkeypatch.setattr(native_crawler, "FastHTTPFetcher", FakeCrawler)
+    async def no_robots(_url):
+        return None
+    monkeypatch.setattr(native_crawler, "_load_robots", no_robots)
 
     _links, stats = asyncio.run(
         native_crawler.crawl_site(
@@ -96,6 +103,10 @@ def test_resume_recovers_legacy_429_from_fetched(tmp_path, monkeypatch):
 
     FakeCrawler.results = {url: result(url, status=200)}
     monkeypatch.setattr(native_crawler, "AsyncWebCrawler", FakeCrawler)
+    monkeypatch.setattr(native_crawler, "FastHTTPFetcher", FakeCrawler)
+    async def no_robots(_url):
+        return None
+    monkeypatch.setattr(native_crawler, "_load_robots", no_robots)
 
     _links, stats = asyncio.run(
         native_crawler.crawl_site(

@@ -9,20 +9,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urljoin, urlsplit
+from urllib.robotparser import RobotFileParser
 from xml.etree import ElementTree
 
 import httpx
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig, HTTPCrawlerConfig
-from crawl4ai.async_crawler_strategy import AsyncHTTPCrawlerStrategy
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 from crawl4ai.async_dispatcher import RateLimiter, SemaphoreDispatcher
 
+from .archive_sources import discover_archive_urls
 from .crawl_priority import YieldPriorityQueue
+from .fast_http import FastHTTPFetcher
 from .link_extractor import extract_external_links, extract_internal_urls
 from .retry_policy import retry_after_seconds, status_int
+from .state_store import CrawlStore
 from .utils import atomic_write_text, canonicalize_url, hostname_from_url, is_valid_public_domain
 
 RETRYABLE = {408, 425, 429, 500, 502, 503, 504}
 DEFAULT_429_BACKOFF = 60.0
+CRAWLER_USER_AGENT = "LiveDropHunter/2.0 (+https://github.com/mhvrt/crawl)"
 
 
 def _allowed_hosts(start_url: str) -> set[str]:
@@ -139,22 +143,45 @@ async def _discover(start_url: str) -> list[str]:
     return sorted(found)
 
 
+async def _load_robots(start_url: str) -> RobotFileParser | None:
+    url = urljoin(start_url, "/robots.txt")
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(20),
+            headers={"User-Agent": CRAWLER_USER_AGENT},
+        ) as client:
+            response = await client.get(url)
+        if not response.is_success:
+            return None
+        parser = RobotFileParser()
+        parser.set_url(url)
+        parser.parse(response.text.splitlines())
+        return parser
+    except httpx.HTTPError:
+        return None
+
+
 async def crawl_site(
     start_url: str,
     output_dir: Path,
     max_pages: int = 0,
-    max_runtime_minutes: int = 315,
+    max_runtime_minutes: int = 270,
     full_page_scan: bool = False,
     use_current_discovery: bool = True,
-    batch_size: int = 4,
+    batch_size: int = 6,
     progress: Callable[[str], None] = print,
     resume: bool = False,
     max_query_variants_per_path: int = 100,
+    use_archive_discovery: bool = False,
+    wayback_limit: int = 100_000,
+    commoncrawl_collections: int = 12,
 ) -> tuple[list[dict], dict]:
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = output_dir / "crawl_checkpoint.json"
     links_file = output_dir / "partial_links.jsonl"
     errors_file = output_dir / "partial_errors.jsonl"
+    store = CrawlStore(output_dir / "crawl_state.sqlite3")
     start_url = canonicalize_url(start_url)
     allowed = _allowed_hosts(start_url)
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -176,11 +203,12 @@ async def crawl_site(
     new_domains_this_run = 0
     stopped_by_rate_limit = False
     host_not_before = 0.0
+    last_snapshot_at = 0.0
 
     def completed_count() -> int:
         return len(live | terminal)
 
-    def enqueue(url: str) -> None:
+    def enqueue(url: str, source: str = "internal") -> None:
         nonlocal skipped_traps
         url = canonicalize_url(url)
         if not url or hostname_from_url(url) not in allowed:
@@ -197,6 +225,8 @@ async def crawl_site(
             seen.add(parts.query)
         queued.add(url)
         queue.append(url)
+        store.set_page(url, "pending")
+        store.add_source(url, source)
 
     def defer(url: str, code: int | None, message: str, not_before: float = 0) -> None:
         url = canonicalize_url(url)
@@ -211,10 +241,31 @@ async def crawl_site(
         }
         deferred[url] = row
         errors[url] = {"url": url, "status": code or "", "error": message}
+        store.set_page(
+            url,
+            "deferred",
+            status=code,
+            error=message,
+            not_before=not_before,
+        )
 
-    if resume and checkpoint.exists():
+    if resume and (checkpoint.exists() or store.get_metadata("start_url")):
         try:
-            state = json.loads(checkpoint.read_text(encoding="utf-8"))
+            sqlite_start_url = store.get_metadata("start_url", "")
+            loaded_from_sqlite = canonicalize_url(sqlite_start_url) == start_url
+            if loaded_from_sqlite:
+                state = store.load_pages()
+                state.update({
+                    "start_url": sqlite_start_url,
+                    "section_yield_stats": store.get_metadata("section_yield_stats", {}),
+                    "host_not_before": store.get_metadata("host_not_before", 0),
+                })
+                errors = {
+                    row["url"]: row
+                    for row in store.load_errors()
+                }
+            else:
+                state = json.loads(checkpoint.read_text(encoding="utf-8"))
             if canonicalize_url(state.get("start_url", "")) == start_url:
                 live = {
                     canonicalize_url(x)
@@ -245,45 +296,48 @@ async def crawl_site(
                             "error": row.get("error", "retryable failure"),
                         }
 
-                links = _read_jsonl(links_file)
+                links = store.load_links() if loaded_from_sqlite else _read_jsonl(links_file)
+                if not links:
+                    links = _read_jsonl(links_file)
                 seen_target_domains = {
                     str(row.get("target_domain") or "").lower()
                     for row in links
                     if is_valid_public_domain(str(row.get("target_domain") or ""))
                 }
 
-                # Repair legacy checkpoints where retryable failures, especially
-                # HTTP 429, were incorrectly counted as fetched.
-                for row in _read_jsonl(errors_file):
-                    u = canonicalize_url(row.get("url", ""))
-                    if not u:
-                        continue
-                    code = status_int(row.get("status"))
-                    if code in RETRYABLE or code is None:
-                        live.discard(u)
-                        terminal.discard(u)
-                        deferred.setdefault(
-                            u,
-                            {
+                # Repair only legacy JSON checkpoints where retryable failures,
+                # especially HTTP 429, were incorrectly counted as fetched.
+                if not loaded_from_sqlite:
+                    for row in _read_jsonl(errors_file):
+                        u = canonicalize_url(row.get("url", ""))
+                        if not u:
+                            continue
+                        code = status_int(row.get("status"))
+                        if code in RETRYABLE or code is None:
+                            live.discard(u)
+                            terminal.discard(u)
+                            deferred.setdefault(
+                                u,
+                                {
+                                    "url": u,
+                                    "status": code or "",
+                                    "error": row.get("error", "retryable failure"),
+                                    "not_before": 0,
+                                },
+                            )
+                            errors[u] = {
                                 "url": u,
                                 "status": code or "",
                                 "error": row.get("error", "retryable failure"),
-                                "not_before": 0,
-                            },
-                        )
-                        errors[u] = {
-                            "url": u,
-                            "status": code or "",
-                            "error": row.get("error", "retryable failure"),
-                        }
-                        recovered += 1
-                    else:
-                        terminal.add(u)
-                        errors[u] = {
-                            "url": u,
-                            "status": code or "",
-                            "error": row.get("error", "crawl failed"),
-                        }
+                            }
+                            recovered += 1
+                        else:
+                            terminal.add(u)
+                            errors[u] = {
+                                "url": u,
+                                "status": code or "",
+                                "error": row.get("error", "crawl failed"),
+                            }
 
                 now = time.time()
                 for u, row in list(deferred.items()):
@@ -293,8 +347,35 @@ async def crawl_site(
                         if u not in live and u not in terminal and u not in queued:
                             queued.add(u)
                             queue.append(u)
+                            store.set_page(u, "pending")
 
                 resumed = True
+                for u in live:
+                    store.set_page(u, "live")
+                    if not loaded_from_sqlite:
+                        store.add_source(u, "legacy_checkpoint")
+                for u in terminal:
+                    row = errors.get(u, {})
+                    store.set_page(
+                        u,
+                        "terminal",
+                        status=status_int(row.get("status")),
+                        error=str(row.get("error") or ""),
+                    )
+                for u in queued:
+                    store.set_page(u, "pending")
+                    if not loaded_from_sqlite:
+                        store.add_source(u, "legacy_checkpoint")
+                for u, row in deferred.items():
+                    store.set_page(
+                        u,
+                        "deferred",
+                        status=status_int(row.get("status")),
+                        error=str(row.get("error") or ""),
+                        not_before=float(row.get("not_before", 0) or 0),
+                    )
+                store.add_links(links)
+                store.commit()
                 progress(
                     f"[resume] live={len(live)} terminal={len(terminal)} "
                     f"pending={len(queue)} deferred={len(deferred)} "
@@ -307,9 +388,19 @@ async def crawl_site(
     if not resumed:
         links_file.unlink(missing_ok=True)
         errors_file.unlink(missing_ok=True)
-        enqueue(start_url)
+        store.reset()
+        enqueue(start_url, "seed")
 
-    def save() -> None:
+    def save(force_snapshot: bool = False) -> None:
+        nonlocal last_snapshot_at
+        store.set_metadata("start_url", start_url)
+        store.set_metadata("section_yield_stats", queue.export_stats())
+        store.set_metadata("host_not_before", round(host_not_before, 3))
+        store.commit()
+        now_monotonic = time.monotonic()
+        if not force_snapshot and now_monotonic - last_snapshot_at < 30:
+            return
+        last_snapshot_at = now_monotonic
         atomic_write_text(
             checkpoint,
             json.dumps(
@@ -345,8 +436,8 @@ async def crawl_site(
             f"[resume] host Retry-After/backoff active for "
             f"{host_not_before-time.time():.1f}s; no requests sent"
         )
-        save()
-        return links, _stats(
+        save(force_snapshot=True)
+        stats = _stats(
             start_url,
             started_at,
             started_epoch,
@@ -371,32 +462,41 @@ async def crawl_site(
             new_domains_this_run,
             seen_target_domains,
         )
+        stats["url_source_counts"] = store.source_counts()
+        store.close()
+        return links, stats
 
     if use_current_discovery and not resumed:
         progress("[discovery] reading current robots/sitemaps")
         try:
             for url in await asyncio.wait_for(_discover(start_url), timeout=120):
-                enqueue(url)
+                enqueue(url, "sitemap")
         except asyncio.TimeoutError:
             progress("[discovery] timed out after 120s; continuing from homepage")
 
+    archive_sources_present = store.source_counts()
+    if use_archive_discovery and not (
+        archive_sources_present.get("wayback")
+        or archive_sources_present.get("commoncrawl")
+    ):
+        progress("[discovery] reading Wayback and Common Crawl URL indexes")
+        archives = await discover_archive_urls(
+            start_url,
+            wayback_limit=wayback_limit,
+            commoncrawl_collections=commoncrawl_collections,
+        )
+        for source, urls in archives.items():
+            for url in urls:
+                enqueue(url, source)
+            progress(f"[discovery] {source} supplied {len(urls)} URLs")
+        save(force_snapshot=True)
+
     seed_count = completed_count() + len(queue) + len(deferred)
     effective_batch_size = max(1, min(int(batch_size), 8))
+    robots = await _load_robots(start_url)
 
-    # Fast default for static HTML: at most two simultaneous requests to a host,
-    # with Crawl4AI's native per-domain pacing/backoff. A 429 still immediately
-    # opens our host-wide circuit breaker and preserves the queue for resume.
-    http_limiter = RateLimiter(
-        base_delay=(0.5, 1.0),
-        max_delay=30,
-        max_retries=1,
-        rate_limit_codes=[429, 503],
-    )
-    http_dispatcher = SemaphoreDispatcher(
-        semaphore_count=2,
-        max_session_permit=2,
-        rate_limiter=http_limiter,
-    )
+    # Static HTML is fetched directly. Crawl4AI remains only as an optional
+    # Chromium fallback for genuine client-rendered shells.
     browser_limiter = RateLimiter(
         base_delay=(1.0, 2.0),
         max_delay=30,
@@ -409,19 +509,6 @@ async def crawl_site(
         rate_limiter=browser_limiter,
     )
 
-    http_strategy = AsyncHTTPCrawlerStrategy(
-        browser_config=HTTPCrawlerConfig(
-            method="GET",
-            verify_ssl=True,
-            follow_redirects=True,
-        )
-    )
-    http_cfg = CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS,
-        check_robots_txt=True,
-        stream=False,
-        verbose=False,
-    )
     browser_cfg = BrowserConfig(
         browser_type="chromium",
         headless=True,
@@ -445,27 +532,38 @@ async def crawl_site(
 
     async with AsyncExitStack() as stack:
         http = await stack.enter_async_context(
-            AsyncWebCrawler(crawler_strategy=http_strategy)
+            FastHTTPFetcher(concurrency=effective_batch_size)
         )
         browser = None
+        browser_disabled = False
 
         async def browser_fetch(url: str):
-            nonlocal browser, browser_attempts, browser_successes
+            nonlocal browser, browser_attempts, browser_successes, browser_disabled
+            if browser_disabled:
+                return None
             browser_attempts += 1
-            if browser is None:
-                progress("[browser] starting Chromium fallback")
-                browser = await stack.enter_async_context(
-                    AsyncWebCrawler(config=browser_cfg)
+            try:
+                if browser is None:
+                    progress("[browser] starting Chromium fallback")
+                    browser = await stack.enter_async_context(
+                        AsyncWebCrawler(config=browser_cfg)
+                    )
+                values = await browser.arun_many(
+                    urls=[url],
+                    config=browser_run,
+                    dispatcher=browser_dispatcher,
                 )
-            values = await browser.arun_many(
-                urls=[url],
-                config=browser_run,
-                dispatcher=browser_dispatcher,
-            )
-            rows = [x async for x in _iter_results(values)]
-            if rows and getattr(rows[0], "success", False):
-                browser_successes += 1
-            return rows[0] if rows else None
+                rows = [x async for x in _iter_results(values)]
+                if rows and getattr(rows[0], "success", False):
+                    browser_successes += 1
+                return rows[0] if rows else None
+            except Exception as exc:
+                browser_disabled = True
+                progress(
+                    f"[browser] fallback unavailable for {url}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return None
 
         async def handle(result, requested: str) -> tuple[bool, int]:
             nonlocal rate_limits, http_successes, host_not_before, new_domains_this_run
@@ -488,7 +586,7 @@ async def crawl_site(
             )
             html = getattr(result, "html", None) or ""
 
-            if code == 429:
+            if code in {429, 503}:
                 rate_limits += 1
                 headers = getattr(result, "response_headers", None)
                 retry_after = retry_after_seconds(
@@ -498,13 +596,13 @@ async def crawl_site(
                 host_not_before = max(host_not_before, time.time() + max(1, delay))
                 defer(
                     requested,
-                    429,
+                    code,
                     getattr(result, "error_message", "")
-                    or "HTTP 429 Too Many Requests",
+                    or f"HTTP {code} temporary rate limit",
                     host_not_before,
                 )
                 progress(
-                    f"[throttle] HTTP 429; stopping this site run for "
+                    f"[throttle] HTTP {code}; stopping this site run for "
                     f"{max(1, delay):.1f}s"
                 )
                 return True, 0
@@ -513,6 +611,7 @@ async def crawl_site(
                 terminal.add(requested)
                 errors.pop(requested, None)
                 queue.record_result(requested, 0)
+                store.set_page(requested, "terminal", status=code)
                 return False, 0
 
             ok = (
@@ -540,6 +639,12 @@ async def crawl_site(
                     or "non-live source page",
                 }
                 queue.record_result(requested, 0)
+                store.set_page(
+                    requested,
+                    "terminal",
+                    status=code,
+                    error=getattr(result, "error_message", "") or "non-live source page",
+                )
                 return False, 0
 
             external = extract_external_links(final, html, code, _title(result))
@@ -612,12 +717,14 @@ async def crawl_site(
             deferred.pop(requested, None)
             errors.pop(requested, None)
             http_successes += 1
+            store.set_page(requested, "live", status=code)
 
             if external:
                 links.extend(external)
                 _append_jsonl(links_file, external)
+                store.add_links(external)
             for url in internal:
-                enqueue(url)
+                enqueue(url, "internal")
 
             return False, new_count
 
@@ -640,18 +747,22 @@ async def crawl_site(
                 queued.discard(url)
                 if url in live or url in terminal or url in deferred:
                     continue
+                if robots is not None and not robots.can_fetch(CRAWLER_USER_AGENT, url):
+                    terminal.add(url)
+                    errors[url] = {
+                        "url": url,
+                        "status": "",
+                        "error": "disallowed by robots.txt",
+                    }
+                    store.set_page(url, "terminal", error="disallowed by robots.txt")
+                    continue
                 batch.append(url)
 
             if not batch:
                 continue
 
             try:
-                values = await http.arun_many(
-                    urls=batch,
-                    config=http_cfg,
-                    dispatcher=http_dispatcher,
-                )
-                rows = [x async for x in _iter_results(values)]
+                rows = await http.fetch_many(batch)
             except Exception as exc:
                 progress(
                     f"[crawl] HTTP batch failed: {type(exc).__name__}: {exc}"
@@ -701,7 +812,9 @@ async def crawl_site(
             deduped.append(row)
     links = deduped
     _write_jsonl(links_file, links)
-    save()
+    save(force_snapshot=True)
+    source_counts = store.source_counts()
+    store.close()
 
     remaining = len(queue) + len(deferred)
     stopped_runtime = time.monotonic() >= deadline and remaining > 0
@@ -711,7 +824,7 @@ async def crawl_site(
         and remaining > 0
     )
 
-    return links, _stats(
+    stats = _stats(
         start_url,
         started_at,
         started_epoch,
@@ -736,6 +849,8 @@ async def crawl_site(
         new_domains_this_run,
         seen_target_domains,
     )
+    stats["url_source_counts"] = source_counts
+    return links, stats
 
 
 def _stats(
@@ -818,6 +933,6 @@ def _stats(
         "stopped_by_runtime_limit": stopped_runtime,
         "stopped_by_page_limit": stopped_page,
         "stopped_by_rate_limit": stopped_rate,
-        "crawler_mode": "crawl4ai-http-first-yield-priority",
+        "crawler_mode": "direct-http2-with-browser-fallback-and-archive-seeds",
         "errors": list(errors.values()),
     }
