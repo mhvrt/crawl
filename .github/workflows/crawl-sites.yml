@@ -15,7 +15,7 @@ on:
       max_runtime_minutes:
         description: "Maximum runtime per site before saving a resumable checkpoint"
         required: false
-        default: "300"
+        default: "270"
         type: string
       full_page_scan:
         description: "Scroll every page to trigger lazy/virtual content (slower)"
@@ -174,7 +174,7 @@ jobs:
           echo "state_found=true" >> "$GITHUB_OUTPUT"
           checkpoint_pending=0
           if [ -f "$checkpoint_file" ]; then
-            checkpoint_pending=$(jq -r '(.pending_urls // []) | length' "$checkpoint_file")
+            checkpoint_pending=$(jq -r '((.pending_urls // []) | length) + ((.deferred_urls // []) | length)' "$checkpoint_file")
           fi
           if [ "$stats_complete" = "true" ] || { [ -f "$checkpoint_file" ] && [ "$checkpoint_pending" -eq 0 ]; }; then
             echo "crawl_complete=true" >> "$GITHUB_OUTPUT"

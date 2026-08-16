@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import re
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urldefrag, urlsplit, urlunsplit
 
@@ -10,6 +11,12 @@ try:
     import tldextract
 except ImportError:  # local/static testing fallback
     tldextract = None
+
+_TLD_EXTRACTOR = (
+    tldextract.TLDExtract(suffix_list_urls=None, cache_dir=None)
+    if tldextract is not None
+    else None
+)
 
 _TRACKING_PARAMS = {
     "fbclid", "gclid", "dclid", "msclkid", "yclid", "mc_cid", "mc_eid",
@@ -53,6 +60,7 @@ def hostname_from_url(url: str) -> str:
     return (urlsplit(url).hostname or "").lower().rstrip(".")
 
 
+@lru_cache(maxsize=100_000)
 def registrable_domain(host_or_url: str) -> str:
     host = hostname_from_url(host_or_url) if "://" in host_or_url else host_or_url.lower().rstrip(".")
     if not host:
@@ -62,14 +70,15 @@ def registrable_domain(host_or_url: str) -> str:
         return host
     except ValueError:
         pass
-    if tldextract is not None:
-        ext = tldextract.TLDExtract(suffix_list_urls=None)(host)
+    if _TLD_EXTRACTOR is not None:
+        ext = _TLD_EXTRACTOR(host)
         return ext.top_domain_under_public_suffix or host
     # Fallback is intentionally conservative; production installs tldextract.
     labels = host.split(".")
     return ".".join(labels[-2:]) if len(labels) >= 2 else host
 
 
+@lru_cache(maxsize=100_000)
 def is_valid_public_domain(domain: str) -> bool:
     """Return True only for a syntactically valid public registrable DNS domain.
 
@@ -88,8 +97,8 @@ def is_valid_public_domain(domain: str) -> bool:
     labels = value.split(".")
     if len(labels) < 2 or any(not _DOMAIN_LABEL_RE.match(label) for label in labels):
         return False
-    if tldextract is not None:
-        ext = tldextract.TLDExtract(suffix_list_urls=None)(value)
+    if _TLD_EXTRACTOR is not None:
+        ext = _TLD_EXTRACTOR(value)
         return bool(ext.domain and ext.suffix and ext.top_domain_under_public_suffix == value)
     # Static-test fallback: require at least a plausible alphabetic/punycode TLD.
     tld = labels[-1]

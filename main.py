@@ -26,9 +26,17 @@ def parse_args():
     p.add_argument("--output", default="output")
     p.add_argument("--run-id", default="")
     p.add_argument("--max-pages", type=int, default=0, help="0 = unlimited (subject to runtime limit)")
-    p.add_argument("--max-runtime-minutes", type=int, default=315)
+    p.add_argument("--max-runtime-minutes", type=int, default=270)
     p.add_argument("--full-page-scan", action="store_true")
     p.add_argument("--no-current-discovery", action="store_true")
+    p.add_argument(
+        "--no-archive-discovery",
+        action="store_true",
+        help="Do not seed a new crawl from Wayback and Common Crawl URL indexes",
+    )
+    p.add_argument("--wayback-limit", type=int, default=100_000)
+    p.add_argument("--commoncrawl-collections", type=int, default=12)
+    p.add_argument("--http-concurrency", type=int, default=6)
     p.add_argument("--rdap-concurrency", type=int, default=6)
     p.add_argument("--write-raw-links-to-sheets", action="store_true")
     p.add_argument("--resume", action="store_true")
@@ -84,6 +92,10 @@ async def main_async():
         max_runtime_minutes=args.max_runtime_minutes,
         full_page_scan=args.full_page_scan,
         use_current_discovery=not args.no_current_discovery,
+        use_archive_discovery=not args.no_archive_discovery,
+        wayback_limit=args.wayback_limit,
+        commoncrawl_collections=args.commoncrawl_collections,
+        batch_size=args.http_concurrency,
         resume=args.resume,
     )
 
@@ -93,6 +105,13 @@ async def main_async():
     summary = summarize_domains(links)
     domains_path = run_dir / "domains_summary.csv"
     write_csv(domains_path, summary, DOMAIN_FIELDS)
+    # Explicit names remove ambiguity between live verification and future
+    # archive-body enrichment. Archive indexes currently seed live checks.
+    write_csv(run_dir / "current_outbound.csv", links, LINK_FIELDS)
+    write_csv(run_dir / "current_domains.csv", summary, DOMAIN_FIELDS)
+    write_csv(run_dir / "historical_outbound.csv", [], LINK_FIELDS)
+    write_csv(run_dir / "historical_domains.csv", [], DOMAIN_FIELDS)
+    write_csv(run_dir / "combined_domains.csv", summary, DOMAIN_FIELDS)
 
     checks = []
     if not args.benchmark:
