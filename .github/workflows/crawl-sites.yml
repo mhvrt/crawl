@@ -50,7 +50,7 @@ on:
       max_continuations:
         description: "Safety limit for automatic five-hour continuation runs"
         required: false
-        default: "24"
+        default: "200"
         type: string
 
 permissions:
@@ -219,6 +219,27 @@ jobs:
           if (( next_index > MAX_CONTINUATIONS )); then
             echo "::error::Automatic continuation safety limit reached with ${{ steps.crawl_state.outputs.remaining_queue_urls }} URLs still queued."
             exit 1
+          fi
+          checkpoint_file="output/$TARGET_SLUG/crawl_checkpoint.json"
+          if [ -f "$checkpoint_file" ]; then
+          wait_seconds=$(python - "$checkpoint_file" <<'PY'
+          import json
+          import math
+          import sys
+          import time
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as handle:
+                  not_before = float(json.load(handle).get("host_not_before", 0) or 0)
+          except (OSError, ValueError, TypeError):
+              not_before = 0
+          print(max(0, math.ceil(not_before - time.time())))
+          PY
+            )
+            if (( wait_seconds > 0 )); then
+              echo "Retry-After is active; waiting ${wait_seconds}s before queuing continuation."
+              sleep "$wait_seconds"
+            fi
           fi
           gh workflow run crawl-sites.yml \
             --ref "$GITHUB_REF_NAME" \
