@@ -1,0 +1,30 @@
+name: User-Agent probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compare User-Agents
+        shell: bash
+        run: |
+          set -euo pipefail
+          for label in browser custom; do
+            if [[ "$label" == browser ]]; then
+              ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0 Safari/537.36'
+            else
+              ua='LiveDropHunter/2.0 (+https://github.com/mhvrt/crawl)'
+            fi
+            echo "[$label]"
+            for i in $(seq 1 10); do
+              curl -L --max-time 20 -sS -D /tmp/fxheaders -o /dev/null \
+                -w "$i\t%{http_code}\t%{size_download}\n" \
+                -A "$ua" https://www.fxstreet.com/
+              if grep -qi '^retry-after:' /tmp/fxheaders; then
+                grep -i '^retry-after:' /tmp/fxheaders | tr -d '\r' | sed 's/^/  /'
+              fi
+              sleep 2
+            done
+          done
