@@ -204,6 +204,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET_DOMAIN: ${{ matrix.site.domain }}
+          TARGET_SLUG: ${{ matrix.site.slug }}
           MAX_PAGES: ${{ inputs.max_pages }}
           MAX_RUNTIME_MINUTES: ${{ inputs.max_runtime_minutes }}
           FULL_PAGE_SCAN: ${{ inputs.full_page_scan }}
